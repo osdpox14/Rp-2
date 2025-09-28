@@ -1,0 +1,146 @@
+name: EnigMano Instance Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      INSTANCE:
+        description: "Instance number to deploy (e.g., 1, 2, 3...)"
+        required: true
+        default: "1"
+
+jobs:
+  deploy-enigmano:
+    runs-on: windows-latest
+
+    env:
+      INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
+      SECRET_SHAHZAIB: ${{ secrets.SECRET_SHAHZAIB }}
+      NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
+      # Your Bot zip (Downloads\Bot target)
+      BOT_ZIP_URL: "https://www.dropbox.com/scl/fo/finl8oqivftlo91fmaphu/AEApbCtwKKbub_B1uDeKEXg?rlkey=4ztjd9h04dfsukww14pdujkf6&st=fi79cec2&dl=1"
+
+    steps:
+      - name: Deployment Parameters
+        shell: pwsh
+        run: |
+          $prevInstance = [int]$env:INSTANCE_ID - 1
+          Write-Host "==============================================="
+          Write-Host "Instance ID          : $env:INSTANCE_ID"
+          Write-Host "Previous Instance    : $prevInstance"
+          Write-Host "Repository           : $env:GITHUB_REPOSITORY"
+          Write-Host "Workflow File        : enigmano.yml"
+          Write-Host "Deployment ID        : $env:GITHUB_RUN_ID"
+          Write-Host "==============================================="
+
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not $env:SECRET_SHAHZAIB) { Write-Error "Missing GitHub Secret: SECRET_SHAHZAIB"; exit 1 }
+          if (-not $env:NGROK_SHAHZAIB) { Write-Error "Missing Ngrok Auth Token: NGROK_SHAHZAIB"; exit 1 }
+          Write-Host "Secrets OK"
+
+      - name: Download EnigMano-instance.ps1
+        shell: pwsh
+        run: |
+          $url = "https://gitlab.com/Shahzaib-YT/enigmano-multi-instance/-/raw/main/EnigMano-instance.ps1"
+          Write-Host "Downloading EnigMano-instance.ps1..."
+          Invoke-WebRequest -Uri $url -OutFile "EnigMano-instance.ps1" -UseBasicParsing
+          if (!(Test-Path "./EnigMano-instance.ps1")) {
+            Write-Error "Failed to download EnigMano-instance.ps1"
+            exit 1
+          }
+          Write-Host "EnigMano-instance.ps1 downloaded successfully"
+
+      # Run EnigMano in background to keep job flowing, BUT we do not touch ngrok
+      - name: Execute EnigMano Instance Script (background; EnigMano controls ngrok)
+        shell: pwsh
+        run: |
+          Write-Host "Starting EnigMano-instance.ps1 in background..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "powershell.exe"
+          $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File ".\EnigMano-instance.ps1"'
+          $psi.UseShellExecute = $true
+          $psi.WindowStyle = 'Hidden'
+          [void][System.Diagnostics.Process]::Start($psi)
+          # Give EnigMano ample time to set password, enable RDP, and start ngrok
+          Start-Sleep -Seconds 180
+
+      - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
+          $downloads = "C:\Users\runneradmin\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $BOT_BASE | Out-Null
+
+          $tmp = Join-Path $env:TEMP ('botdl_' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+          try {
+            $zipPath = Join-Path $tmp 'bot.zip'
+            Write-Host ("Downloading Bot.zip from {0} ..." -f $env:BOT_ZIP_URL)
+            Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
+
+            $extract = Join-Path $tmp 'unzipped'
+            Expand-Archive -Path $zipPath -DestinationPath $extract -Force
+
+            $candidates = @(
+              (Join-Path $extract 'Bot'),
+              (Join-Path $extract 'bot')
+            ) | Where-Object { Test-Path $_ }
+
+            if ($candidates.Count -gt 0) {
+              $root = $candidates[0]
+              Write-Host ("Found root folder in archive: {0}" -f $root)
+              Copy-Item -Path (Join-Path $root '*') -Destination $BOT_BASE -Recurse -Force
+            } else {
+              Write-Host "No root 'Bot' folder; copying all extracted files into BOT_BASE"
+              Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
+            }
+
+            Write-Host "Downloads directory listing:"
+            Get-ChildItem -Force $downloads | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+            Write-Host "Bot directory listing:"
+            Get-ChildItem -Force $BOT_BASE | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+
+          } finally {
+            try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+      - name: Launch bots (start-bots.bat)
+        shell: pwsh
+        run: |
+          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
+          $bat = Join-Path $BOT_BASE 'start-bots.bat'
+          if (-not (Test-Path $bat)) { throw ("start-bots.bat not found at {0}" -f $bat) }
+          Write-Host "Launching bots via start-bots.bat ..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $bat
+          $psi.WorkingDirectory = $BOT_BASE
+          $psi.UseShellExecute = $true
+          $psi.WindowStyle = 'Normal'
+          [void][System.Diagnostics.Process]::Start($psi)
+
+      # Keep the runner alive so the ngrok tunnel (spawned by EnigMano) keeps running
+      - name: Keep session open (fixed window, heartbeat)
+        shell: pwsh
+        run: |
+          $minutes = 180
+          $interval = 20
+          $loops = [Math]::Ceiling(($minutes * 60) / $interval)
+          Write-Host ("Holding session open for {0} minutes with {1}s heartbeat..." -f $minutes, $interval)
+          for ($i = 1; $i -le $loops; $i++) {
+            Write-Host ("Heartbeat {0}/{1}  (remaining ~{2} min)" -f $i, $loops, [Math]::Round(($loops - $i) * $interval / 60.0, 1))
+            Start-Sleep -Seconds $interval
+          }
+          Write-Host "Fixed hold complete."
+
+      - name: Final Status
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ("Pipeline finished for instance {0}." -f $env:INSTANCE_ID)

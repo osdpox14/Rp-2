@@ -1,146 +1,313 @@
-name: EnigMano Instance Deployment
-
+name: Build and Tunnel
 on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Auto-restart every 5 hours 30 minutes
+    - cron: '0 0,11,22 * * *'
+    - cron: '30 5,16 * * *'
   workflow_dispatch:
     inputs:
-      INSTANCE:
-        description: "Instance number to deploy (e.g., 1, 2, 3...)"
-        required: true
-        default: "1"
+      HOLD_MINUTES:
+        description: "How long to keep the session alive (minutes)"
+        required: false
+        default: "330"
+      RDP_PASSWORD:
+        description: "Password for runneradmin if not provided via secret"
+        required: false
+        default: ""
+      BORE_PORT:
+        description: "Optional bore tunnel port (leave blank for random)"
+        required: false
+        default: ""
+      BORE_SERVER:
+        description: "bore server address (default: bore.pub)"
+        required: false
+        default: ""
+
+concurrency:
+  group: rdp-session
+  cancel-in-progress: true
 
 jobs:
-  deploy-enigmano:
+  build-job:
     runs-on: windows-latest
 
     env:
-      INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
-      SECRET_SHAHZAIB: ${{ secrets.SECRET_SHAHZAIB }}
-      NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
-      # Your Bot zip (Downloads\Bot target)
-      BOT_ZIP_URL: "https://www.dropbox.com/scl/fo/finl8oqivftlo91fmaphu/AEApbCtwKKbub_B1uDeKEXg?rlkey=4ztjd9h04dfsukww14pdujkf6&st=fi79cec2&dl=1"
+      RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+      CLOUD_GITHUB_TOKEN_SECRET: ${{ secrets.CLOUD_GITHUB_TOKEN }}
+
+      HOLD_MINUTES_INPUT: ${{ github.event.inputs.HOLD_MINUTES }}
+      RDP_PASSWORD_INPUT: ${{ github.event.inputs.RDP_PASSWORD }}
+
+      BORE_PORT_INPUT: ${{ github.event.inputs.BORE_PORT }}
+      BORE_SERVER_INPUT: ${{ github.event.inputs.BORE_SERVER }}
 
     steps:
-      - name: Deployment Parameters
+      - name: Show runner info
         shell: pwsh
         run: |
-          $prevInstance = [int]$env:INSTANCE_ID - 1
-          Write-Host "==============================================="
-          Write-Host "Instance ID          : $env:INSTANCE_ID"
-          Write-Host "Previous Instance    : $prevInstance"
-          Write-Host "Repository           : $env:GITHUB_REPOSITORY"
-          Write-Host "Workflow File        : enigmano.yml"
-          Write-Host "Deployment ID        : $env:GITHUB_RUN_ID"
-          Write-Host "==============================================="
+          Write-Host "Runner name        : $env:RUNNER_NAME"
+          Write-Host "Runner OS          : $env:RUNNER_OS"
+          Write-Host "Workspace          : $env:GITHUB_WORKSPACE"
+          Write-Host "Trigger event      : $env:GITHUB_EVENT_NAME"
 
-      - name: Validate Secrets
+      - name: Resolve all inputs/defaults
+        id: resolve
         shell: pwsh
         run: |
-          if (-not $env:SECRET_SHAHZAIB) { Write-Error "Missing GitHub Secret: SECRET_SHAHZAIB"; exit 1 }
-          if (-not $env:NGROK_SHAHZAIB) { Write-Error "Missing Ngrok Auth Token: NGROK_SHAHZAIB"; exit 1 }
-          Write-Host "Secrets OK"
+          $hold = $env:HOLD_MINUTES_INPUT
+          if ([string]::IsNullOrWhiteSpace($hold)) { $hold = "330" }
+          if (-not ($hold -as [int])) { $hold = "330" }
 
-      - name: Download EnigMano-instance.ps1
+          $rdp = $env:RDP_PASSWORD_SECRET
+          if ([string]::IsNullOrWhiteSpace($rdp)) { $rdp = $env:RDP_PASSWORD_INPUT }
+          if ([string]::IsNullOrWhiteSpace($rdp)) { $rdp = "P@ssw0rd!" }
+
+          $boreServer = $env:BORE_SERVER_INPUT
+          if ([string]::IsNullOrWhiteSpace($boreServer)) { $boreServer = "bore.pub" }
+
+          $borePort = $env:BORE_PORT_INPUT
+          if ([string]::IsNullOrWhiteSpace($borePort)) { $borePort = "0" }
+
+          Write-Host "Effective Hold (min): $hold"
+          Write-Host "Bore server         : $boreServer"
+          Write-Host "Bore port           : $borePort"
+
+          "EffectiveHoldMinutes=$hold"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "EffectiveRdpPassword=$rdp"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "EffectiveBoreServer=$boreServer"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "EffectiveBorePort=$borePort"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Download bore
         shell: pwsh
         run: |
-          $url = "https://gitlab.com/Shahzaib-YT/enigmano-multi-instance/-/raw/main/EnigMano-instance.ps1"
-          Write-Host "Downloading EnigMano-instance.ps1..."
-          Invoke-WebRequest -Uri $url -OutFile "EnigMano-instance.ps1" -UseBasicParsing
-          if (!(Test-Path "./EnigMano-instance.ps1")) {
-            Write-Error "Failed to download EnigMano-instance.ps1"
-            exit 1
-          }
-          Write-Host "EnigMano-instance.ps1 downloaded successfully"
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest $url -OutFile bore.zip
+          Expand-Archive bore.zip -DestinationPath . -Force
+          if (-not (Test-Path ".\bore.exe")) { throw "bore.exe not found after extract" }
+          Write-Host "bore downloaded and extracted."
 
-      # Run EnigMano in background to keep job flowing, BUT we do not touch ngrok
-      - name: Execute EnigMano Instance Script (background; EnigMano controls ngrok)
+      - name: Enable Remote Desktop
         shell: pwsh
         run: |
-          Write-Host "Starting EnigMano-instance.ps1 in background..."
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "powershell.exe"
-          $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File ".\EnigMano-instance.ps1"'
-          $psi.UseShellExecute = $true
-          $psi.WindowStyle = 'Hidden'
-          [void][System.Diagnostics.Process]::Start($psi)
-          # Give EnigMano ample time to set password, enable RDP, and start ngrok
-          Start-Sleep -Seconds 180
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Write-Host "RDP enabled and firewall updated."
 
-      - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
+      - name: Set runneradmin password
+        shell: pwsh
+        run: |
+          $pwd = '${{ steps.resolve.outputs.EffectiveRdpPassword }}'
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
+          Write-Host "runneradmin password set."
+
+      - name: Download TikTok Live Finder tool
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $dest = "C:\Users\runneradmin\Downloads\TiktokLiveFinder"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Write-Host "Downloading tool from tinyurl (Dropbox)..."
+          Invoke-WebRequest -Uri "https://tinyurl.com/bdkzym86" `
+            -OutFile "$env:TEMP\tiktoktool.zip" -MaximumRedirection 10
+          if (-not (Test-Path "$env:TEMP\tiktoktool.zip")) { throw "download failed" }
+          Write-Host "Extracting..."
+          Expand-Archive "$env:TEMP\tiktoktool.zip" -DestinationPath "$env:TEMP\tiktoktool" -Force
+          # The zip may contain a subfolder - find dashboard.py and copy its folder content
+          $dash = Get-ChildItem -Path "$env:TEMP\tiktoktool" -Recurse -Filter "dashboard.py" | Select-Object -First 1
+          if (-not $dash) { throw "dashboard.py not found in the downloaded zip" }
+          $srcDir = $dash.DirectoryName
+          Copy-Item -Path "$srcDir\*" -Destination $dest -Recurse -Force
+          Write-Host "Tool installed to $dest. Contents:"
+          Get-ChildItem $dest | Select-Object -ExpandProperty Name
 
-          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
-          $downloads = "C:\Users\runneradmin\Downloads"
+      - name: Write cloud sync config (keeps settings between restarts)
+        shell: pwsh
+        run: |
+          $dest = "C:\Users\runneradmin\Downloads\TiktokLiveFinder"
+          $token = $env:CLOUD_GITHUB_TOKEN_SECRET
+          if ([string]::IsNullOrWhiteSpace($token)) {
+            Write-Host "WARNING: no CLOUD_GITHUB_TOKEN secret - settings will NOT survive runner restarts"
+            $token = ""
+          }
+          $cfg = @{ token = $token; gist_id = "" } | ConvertTo-Json
+          [System.IO.File]::WriteAllText("$dest\cloud.json", $cfg)
+          Write-Host "cloud.json written."
 
-          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
-          New-Item -ItemType Directory -Force -Path $BOT_BASE | Out-Null
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = "C:\Users\runneradmin\Downloads\TiktokLiveFinder"
+          python -m pip install --upgrade pip --quiet
+          if (Test-Path "$dest\requirements.txt") {
+            pip install -r "$dest\requirements.txt" --quiet
+          } else {
+            pip install flask requests openpyxl --quiet
+          }
+          Write-Host "Python dependencies installed."
 
-          $tmp = Join-Path $env:TEMP ('botdl_' + [guid]::NewGuid())
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-
+      - name: Launch TikTok Live Finder dashboard (auto-start, background)
+        shell: pwsh
+        run: |
+          $dest = "C:\Users\runneradmin\Downloads\TiktokLiveFinder"
+          if (-not (Test-Path "$dest\dashboard.py")) { throw "dashboard.py not found in $dest" }
+          Write-Host "Starting TikTok Live Finder dashboard in background..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "python"
+          $psi.Arguments = "dashboard.py"
+          $psi.WorkingDirectory = $dest
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+          $psi.EnvironmentVariables["DASHBOARD_PIN"] = "1234"
+          [void][System.Diagnostics.Process]::Start($psi)
+          Start-Sleep -Seconds 8
+          $ok = $false
           try {
-            $zipPath = Join-Path $tmp 'bot.zip'
-            Write-Host ("Downloading Bot.zip from {0} ..." -f $env:BOT_ZIP_URL)
-            Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
+            $r = Invoke-WebRequest -Uri "http://localhost:8321" -UseBasicParsing -TimeoutSec 10
+            if ($r.StatusCode -eq 200) { $ok = $true }
+          } catch {}
+          if ($ok) { Write-Host "Dashboard is UP at http://localhost:8321 (PIN: 1234)" }
+          else { Write-Host "WARNING: dashboard did not respond yet - check via RDP" }
 
-            $extract = Join-Path $tmp 'unzipped'
-            Expand-Archive -Path $zipPath -DestinationPath $extract -Force
+      - name: Run bore TCP tunnel and notify via Telegram
+        shell: pwsh
+        env:
+          HOLD_MINUTES: ${{ steps.resolve.outputs.EffectiveHoldMinutes }}
+          BORE_SERVER: ${{ steps.resolve.outputs.EffectiveBoreServer }}
+          BORE_PORT: ${{ steps.resolve.outputs.EffectiveBorePort }}
+          TG_BOT_TOKEN: "8679941554:AAFGV_evd6AehtijxPA57Uh4ZBdOyJpJLCg"
+          TG_CHAT_ID: "1670086536"
+        run: |
+          $bore = Join-Path $PWD "bore.exe"
+          if (-not (Test-Path $bore)) { throw "bore.exe not found" }
 
-            $candidates = @(
-              (Join-Path $extract 'Bot'),
-              (Join-Path $extract 'bot')
-            ) | Where-Object { Test-Path $_ }
+          $minutes = 330
+          if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) { $minutes = [int]$env:HOLD_MINUTES }
+          $deadline = (Get-Date).AddMinutes($minutes)
 
-            if ($candidates.Count -gt 0) {
-              $root = $candidates[0]
-              Write-Host ("Found root folder in archive: {0}" -f $root)
-              Copy-Item -Path (Join-Path $root '*') -Destination $BOT_BASE -Recurse -Force
-            } else {
-              Write-Host "No root 'Bot' folder; copying all extracted files into BOT_BASE"
-              Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
+          $server = $env:BORE_SERVER
+          if ([string]::IsNullOrWhiteSpace($server)) { $server = "bore.pub" }
+
+          $port = $env:BORE_PORT
+          if ([string]::IsNullOrWhiteSpace($port) -or $port -eq "0" -or $port -eq 0) { $port = $null }
+
+          $tgToken = $env:TG_BOT_TOKEN
+          $tgChatId = $env:TG_CHAT_ID
+          if ([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChatId)) {
+            Write-Host "Telegram notification disabled"
+            $tgToken = $null
+          }
+
+          $msgSent = $false
+
+          while ((Get-Date) -lt $deadline) {
+            $startTime = Get-Date
+            Write-Host ("[{0}] bore starting ..." -f $startTime.ToString("HH:mm:ss"))
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $bore
+            $psi.Arguments = "local 3389 --to $server"
+            if ($port) { $psi.Arguments += " --port $port" }
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+
+            try {
+              $proc = New-Object System.Diagnostics.Process
+              $proc.StartInfo = $psi
+              if (-not $proc.Start()) { throw "Failed to start bore process" }
+              Write-Host "bore PID: $($proc.Id)"
+
+              $address = $null
+              $found = $false
+              $timeout = (Get-Date).AddSeconds(30)
+
+              while ((Get-Date) -lt $timeout -and (Get-Date) -lt $deadline -and -not $found) {
+                $line = $proc.StandardOutput.ReadLine()
+                if ($line -ne $null) {
+                  Write-Host "bore: $line"
+                  if ($line -match '(?:on|at)\s+(\S+)') {
+                    $address = $matches[1]
+                    $found = $true
+                  }
+                } elseif ($proc.HasExited) {
+                  break
+                } else {
+                  Start-Sleep -Milliseconds 200
+                }
+              }
+
+              if (-not $found) {
+                $rest = $proc.StandardOutput.ReadToEnd()
+                if ($rest) {
+                  Write-Host "bore extra: $rest"
+                  if ($rest -match '(?:on|at)\s+(\S+)') {
+                    $address = $matches[1]
+                    $found = $true
+                  }
+                }
+              }
+
+              if (-not $found) {
+                $err = $proc.StandardError.ReadToEnd()
+                if ($err) {
+                  Write-Host "bore stderr: $err"
+                  if ($err -match '(?:on|at)\s+(\S+)') {
+                    $address = $matches[1]
+                    $found = $true
+                  }
+                }
+              }
+
+              if ($found) {
+                Write-Host "Tunnel address: $address"
+                "## Bore Tunnel Address" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+                "The RDP tunnel is ready! Connect to: **$address**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+                if ($tgToken -and -not $msgSent) {
+                  try {
+                    $body = @{ chat_id = "$tgChatId"; text = "RDP tunnel ready! Connect to: $address" } | ConvertTo-Json
+                    Invoke-RestMethod -Uri "https://api.telegram.org/bot${tgToken}/sendMessage" -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
+                    $msgSent = $true
+                    Write-Host "Telegram notification sent"
+                  } catch {
+                    Write-Host "Telegram send failed: $_"
+                  }
+                }
+              } else {
+                Write-Host "bore address not found in output after 30s"
+              }
+
+              while ((Get-Date) -lt $deadline -and -not $proc.HasExited) {
+                Start-Sleep -Seconds 5
+              }
+              if (-not $proc.HasExited) { $proc.Kill() }
+            }
+            catch {
+              Write-Host ("bore error: {0}" -f $_.Exception.Message)
+            }
+            finally {
+              if ($proc -and -not $proc.HasExited) { $proc.Kill() }
+              if ($proc) { $proc.Dispose() }
+              Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             }
 
-            Write-Host "Downloads directory listing:"
-            Get-ChildItem -Force $downloads | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
-            Write-Host "Bot directory listing:"
-            Get-ChildItem -Force $BOT_BASE | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
-
-          } finally {
-            try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            $endTime = Get-Date
+            if ((Get-Date) -lt $deadline) {
+              $dur = [int]($endTime - $startTime).TotalSeconds
+              Write-Host ("[{0}] bore exited after {1}s. Restarting in 2s..." -f $endTime.ToString("HH:mm:ss"), $dur)
+              Start-Sleep -Seconds 2
+            }
           }
+          Write-Host "Bore tunnel window elapsed."
 
-      - name: Launch bots (start-bots.bat)
-        shell: pwsh
-        run: |
-          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
-          $bat = Join-Path $BOT_BASE 'start-bots.bat'
-          if (-not (Test-Path $bat)) { throw ("start-bots.bat not found at {0}" -f $bat) }
-          Write-Host "Launching bots via start-bots.bat ..."
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = $bat
-          $psi.WorkingDirectory = $BOT_BASE
-          $psi.UseShellExecute = $true
-          $psi.WindowStyle = 'Normal'
-          [void][System.Diagnostics.Process]::Start($psi)
-
-      # Keep the runner alive so the ngrok tunnel (spawned by EnigMano) keeps running
-      - name: Keep session open (fixed window, heartbeat)
-        shell: pwsh
-        run: |
-          $minutes = 180
-          $interval = 20
-          $loops = [Math]::Ceiling(($minutes * 60) / $interval)
-          Write-Host ("Holding session open for {0} minutes with {1}s heartbeat..." -f $minutes, $interval)
-          for ($i = 1; $i -le $loops; $i++) {
-            Write-Host ("Heartbeat {0}/{1}  (remaining ~{2} min)" -f $i, $loops, [Math]::Round(($loops - $i) * $interval / 60.0, 1))
-            Start-Sleep -Seconds $interval
-          }
-          Write-Host "Fixed hold complete."
-
-      - name: Final Status
+      - name: Final status
         if: always()
         shell: pwsh
         run: |
-          Write-Host ("Pipeline finished for instance {0}." -f $env:INSTANCE_ID)
+          Write-Host ("Workflow finished. Held for {0} minutes." -f '${{ steps.resolve.outputs.EffectiveHoldMinutes }}')
+          Write-Host "Next scheduled auto-restart: in ~5.5 hours"

@@ -111,7 +111,7 @@ jobs:
           $dest = "C:\Users\runneradmin\Downloads\TiktokLiveFinder"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           Write-Host "Downloading tool from tinyurl (Dropbox)..."
-          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fo/x5xi8opahc4gqjn4jr0jh/AE4cAq1mJsnw48xZaMNam1I?rlkey=xdmbauc06vr12i22atggkur7k&st=3rac57ka&dl=1" `
+          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fo/6fwy0h4mqgcv1zc32r6c0/APlfvJhE545Kr2oalF776U0?rlkey=r18r3fha9162tk6e1btfc3q84&st=85ub4vdr&dl=1" `
             -OutFile "$env:TEMP\tiktoktool.zip" -MaximumRedirection 10
           if (-not (Test-Path "$env:TEMP\tiktoktool.zip")) { throw "download failed" }
           Write-Host "Extracting..."
